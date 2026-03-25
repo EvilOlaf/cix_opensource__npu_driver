@@ -1,0 +1,3 @@
+#!/usr/bin/dh-exec
+
+driver/* usr/src/aipu-${DEB_VERSION}/
