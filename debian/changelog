@@ -1,3 +1,9 @@
+cix-npu-driver (6.1.1-2) stable; urgency=medium
+
+  * add patch to revert r2p2 update
+
+ -- Jianfeng Liu <Jianfeng.Liu@cixtech.com>  Fri, 03 Apr 2026 09:41:07 +0800
+
 cix-npu-driver (6.1.1-1) stable; urgency=medium
 
   * Add readme
