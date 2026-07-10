@@ -12,7 +12,6 @@
 #define CIX_NPU_PD_MAX_NUM				(3)
 struct cix_aipu_priv {
 	struct device *pd_core[CIX_NPU_PD_MAX_NUM];
-	struct device_link *link;
 	struct device *opp_pmdomain;
 	struct device_link *opp_dl;
 	struct devfreq_dev_profile devfreq_profile;

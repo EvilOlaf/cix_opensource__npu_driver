@@ -57,7 +57,6 @@ struct job_irq_info {
 	u32 tag_id;
 	u32 tail_tcbp;
 	u32 sig_flag;
-	u32 group_id;
 	u64 tick_counter;
 };
 
@@ -134,7 +133,7 @@ struct qos {
  * @qlist: TCB queue in different QoS lists
  * @created: is this command pool created
  * @aborted: is this command pool aborted
- * @bind:   is this command pool for bind dispatch
+ * @debug:   is this command pool for debug dispatch
  * @last_exec_flag: execution flag of the last job in this command pool
  */
 struct command_pool {
@@ -142,7 +141,7 @@ struct command_pool {
 	struct qos qlist[AIPU_JOB_QOS_MAX];
 	bool created;
 	bool aborted;
-	bool bind;
+	bool debug;
 	u32  last_exec_flag;
 };
 
@@ -170,7 +169,7 @@ struct command_pool {
  * @exit_tcb:        buffer of the exit_TCB
  * @tick_counter:    atomic lock for tick counter
  * @is_suspend:      is suspended or not
- * @dbg_do_destroy:  do destroy flag (enabled after a bind-dispatch job ends)
+ * @dbg_do_destroy:  do destroy flag (enabled after a debug-dispatch job ends)
  * @tec_intr_en:     is TEC interrupts enabled or not
  * @grid_id:         the latest grid ID allocated for userspace
  * @group_id_bmap:   gruop ID bitmap
@@ -247,5 +246,4 @@ int aipu_job_manager_free_sflag_id(struct aipu_job_manager *manager,
 
 int aipu_job_manager_alloc_exec_id(struct aipu_job_manager *manager,
 				  u64 *job_id);
-void aipu_sched_pending_job_lock(struct aipu_partition *part);
 #endif /* __AIPU_JOB_MANAGER_H__ */
