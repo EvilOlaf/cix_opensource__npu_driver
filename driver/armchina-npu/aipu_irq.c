@@ -4,7 +4,6 @@
 #include <linux/slab.h>
 #include <linux/interrupt.h>
 #include <linux/irqreturn.h>
-#include <linux/device.h>
 #include <linux/version.h>
 #include "aipu_irq.h"
 #include "aipu_partition.h"
@@ -12,8 +11,8 @@
 
 static irqreturn_t aipu_irq_handler_upper_half(int irq, void *dev_id)
 {
-	struct device *dev = dev_id;
-	struct aipu_partition *partition = dev_get_drvdata(dev);
+	struct aipu_priv *aipu =(((struct device *)dev_id)->driver_data);
+	struct aipu_partition *partition = aipu->partitions;
 
 	if (partition && partition->ops && partition->ops->upper_half)
 		return partition->ops->upper_half(partition);

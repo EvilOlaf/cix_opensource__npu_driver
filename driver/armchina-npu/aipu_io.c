@@ -19,8 +19,6 @@ int init_aipu_ioregion(struct io_region *region, u64 phys_base, u32 size)
 	if (!region || !size)
 		return -EINVAL;
 
-	region->phys = phys_base;
-	region->size = size;
 	if (!request_mem_region(phys_base, size, "aipu"))
 		return -ENOMEM;
 
@@ -30,6 +28,8 @@ int init_aipu_ioregion(struct io_region *region, u64 phys_base, u32 size)
 		return -ENOMEM;
 	}
 
+	region->phys = phys_base;
+	region->size = size;
 	return ret;
 }
 

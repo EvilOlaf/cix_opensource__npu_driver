@@ -76,15 +76,13 @@ int init_aipu_priv(struct aipu_priv *aipu, struct platform_device *p_dev,
 	aipu->dbg_reg.size = 0;
 	aipu->ops = NULL;
 
-	ret = zhouyi_detect_aipu_version(p_dev, &version, &config, &revision);
-	if (ret)
-		return ret;
+	zhouyi_detect_aipu_version(p_dev, &version, &config, &revision);
 	dev_dbg(aipu->dev, "AIPU core0 ISA version %d, configuration %d\n", version, config);
 	aipu->version = version;
 	aipu->revision = revision;
 
 #if defined(CONFIG_ARMCHINA_NPU_ARCH_V3_2)
-	if (version >= AIPU_ISA_VERSION_ZHOUYI_V3_2_0) {
+	if (version >= AIPU_ISA_VERSION_ZHOUYI_V3_2) {
 		aipu->ops = get_v3_2_priv_ops();
 		aipu->core_reset_delay_us = AIPU_CONFIG_CORE_RESET_DELAY_US;
 	}
@@ -108,24 +106,21 @@ int init_aipu_priv(struct aipu_priv *aipu, struct platform_device *p_dev,
 
 	ret = init_misc_dev(aipu);
 	if (ret)
-		goto finish;
+		goto err_handle;
 
 	ret = aipu_init_mm(&aipu->mm, p_dev, version);
 	if (ret)
-		goto err_init_mm;
+		goto err_handle;
 
 	ret = init_aipu_job_manager(&aipu->job_manager, &aipu->mm, aipu);
 	if (ret)
-		goto err_init_job_manager;
+		goto err_handle;
 
 	aipu->is_init = true;
-	return ret;
+	goto finish;
 
-err_init_job_manager:
-	aipu_deinit_mm(&aipu->mm);
-
-err_init_mm:
-	deinit_misc_dev(aipu);
+err_handle:
+	deinit_aipu_priv(aipu);
 
 finish:
 	return ret;

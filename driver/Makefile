@@ -3,6 +3,10 @@
 
 MODULE_NAME := aipu
 SRC_DIR := .
+# Resolve version.mk relative to this Makefile so it works both for a direct
+# `make -C driver` build and for the kernel Kbuild phase (cwd = kernel tree).
+KMD_SELF_DIR := $(dir $(lastword $(MAKEFILE_LIST)))
+-include $(KMD_SELF_DIR)version.mk
 EXTRA_CFLAGS += -DKMD_VERSION=\"$(COMPASS_DRV_BTENVAR_KMD_VERSION)\" \
                    -I$(PWD)/armchina-npu/ -I$(PWD)/armchina-npu/include -I$(PWD)/armchina-npu/zhouyi \
                    -D$(BUILD_AIPU_VERSION_KMD)
@@ -81,11 +85,8 @@ else
 endif
 
 ifneq ($(BUILD_NPU_DEVFREQ), n)
-    scmi_hdr := $(srctree)/include/linux/scmi_protocol.h
-    ifneq ($(shell grep -q 'scmi_device_get_freq' $(scmi_hdr) 2>/dev/null && echo y),)
-        EXTRA_CFLAGS  += -DCONFIG_ENABLE_DEVFREQ
-        ccflags-y  += -DCONFIG_ENABLE_DEVFREQ
-    endif
+    EXTRA_CFLAGS  += -DCONFIG_ENABLE_DEVFREQ
+    ccflags-y  += -DCONFIG_ENABLE_DEVFREQ
 endif
 
 OBJS     := $(COMM_OBJ) $(AIPU_OBJ) $(SOC_OBJ)
