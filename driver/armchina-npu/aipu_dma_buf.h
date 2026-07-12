@@ -15,7 +15,8 @@ struct aipu_dma_buf_priv {
 	u64 dma_pa;   /* the original addr from dma subsystem */
 	u64 bytes;
 	void *va;
-	struct sg_table *sgt;
+	struct page **pages;  /* source pages from aipu_phy_block (scattered) */
+	u32 page_count;       /* number of pages */
 };
 
 struct aipu_dma_buf_importer {
@@ -23,13 +24,31 @@ struct aipu_dma_buf_importer {
 	struct dma_buf_attachment *attach;
 	struct sg_table *table;
 	struct list_head node;
-	struct aipu_buf_desc desc;
+	/*
+	 * dma_buf reference held for the whole lifetime of this attachment, and
+	 * the file that created it. filp lets aipu_release() reclaim imports the
+	 * owner never detached (e.g. on crash); holding our own dmabuf ref makes
+	 * that teardown safe regardless of userspace fd close order.
+	 */
+	struct dma_buf *dmabuf;
+	struct file *filp;
+	/*
+	 * V3 custom-IOVA import only: the NPU pa this buffer was mapped to in the
+	 * NPU's custom IOVA domain, the page-aligned size mapped, and the ASID.
+	 * map_size == 0 means the legacy (standard DMA API) import path was used
+	 * and the pa came straight from sg_dma_address().
+	 */
+	u64 dev_pa;
+	u64 map_size;
+	u32 asid;
 };
 
 int aipu_alloc_dma_buf(struct aipu_memory_manager *mm, struct aipu_dma_buf_request *request);
 int aipu_free_dma_buf(struct aipu_memory_manager *mm, int fd);
 int aipu_get_dma_buf_info(struct aipu_dma_buf *dmabuf_info);
-int aipu_attach_dma_buf(struct aipu_memory_manager *mm, struct aipu_dma_buf *dmabuf_info);
+int aipu_attach_dma_buf(struct aipu_memory_manager *mm, struct aipu_dma_buf *dmabuf_info,
+			struct file *filp);
 int aipu_detach_dma_buf(struct aipu_memory_manager *mm, int fd);
+void aipu_detach_dma_buf_by_filp(struct aipu_memory_manager *mm, struct file *filp);
 
 #endif /* __AIPU_DMA_BUF_H__ */

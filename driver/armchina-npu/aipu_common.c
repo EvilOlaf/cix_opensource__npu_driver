@@ -11,7 +11,9 @@
 #endif
 
 #define MAX_CHAR_SYSFS 4096
+#define KBUF_MAX_SIZE 1024
 #define ADDR_VALUE 2
+#define ADDR_ONLY  1
 
 #ifdef CONFIG_SYSFS
 ssize_t aipu_common_ext_register_sysfs_show(struct device *dev,
@@ -34,7 +36,7 @@ ssize_t aipu_common_ext_register_sysfs_show(struct device *dev,
 	    get_soc_ops(partition)->is_clk_enabled &&
 	    !get_soc_ops(partition)->is_clk_enabled(dev, get_soc(partition))) {
 		return snprintf(buf, MAX_CHAR_SYSFS,
-				"AIPU is suspended and external registers cannot be read!\n");
+		    "AIPU is suspended and external registers cannot be read!\n");
 	}
 
 	ret += snprintf(tmp, 512, "----------------------------------------------\n");
@@ -100,6 +102,21 @@ ssize_t aipu_common_ext_register_sysfs_store(struct device *dev,
 #endif
 
 	return count;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 }
 
 ssize_t aipu_common_clock_sysfs_show(struct device *dev,
@@ -118,7 +135,7 @@ ssize_t aipu_common_clock_sysfs_show(struct device *dev,
 	    get_soc_ops(partition)->is_clk_enabled &&
 	    !get_soc_ops(partition)->is_clk_enabled(dev, get_soc(partition)))
 		return snprintf(buf, MAX_CHAR_SYSFS,
-						"AIPU is in clock gating state and suspended.\n");
+				"AIPU is in clock gating state and suspended.\n");
 	else
 		return snprintf(buf, MAX_CHAR_SYSFS, "AIPU is in normal working state.\n");
 }

@@ -22,45 +22,48 @@ static void aipu_dma_buf_detach(struct dma_buf *dmabuf, struct dma_buf_attachmen
 static struct sg_table *aipu_map_dma_buf(struct dma_buf_attachment *attach,
 					 enum dma_data_direction dir)
 {
-	int ret = 0;
-	struct sg_table *sgt = NULL;
-	struct aipu_dma_buf_priv *priv = (struct aipu_dma_buf_priv *)attach->dmabuf->priv;
-	struct device *npu = priv->mm->dev;
+	struct sg_table *sgt;
+	struct aipu_dma_buf_priv *priv = attach->dmabuf->priv;
+	int ret;
 
-	if (priv->sgt)
-		return priv->sgt;
-
-	sgt = devm_kmalloc(npu, sizeof(*sgt), GFP_KERNEL);
+	sgt = kzalloc(sizeof(*sgt), GFP_KERNEL);
 	if (!sgt)
 		return NULL;
 
-	ret = dma_get_sgtable_attrs(attach->dev, sgt, priv->va, priv->dma_pa, priv->bytes, 0);
+	ret = sg_alloc_table_from_pages(sgt, priv->pages, priv->page_count,
+					0, (u64)priv->page_count << PAGE_SHIFT,
+					GFP_KERNEL);
 	if (ret < 0) {
-		dev_err(npu, "failed to get scatterlist from DMA API\n");
-		goto fail;
+		dev_err(priv->mm->dev, "failed to build sgtable from pages\n");
+		kfree(sgt);
+		return NULL;
 	}
 
 #if KERNEL_VERSION(5, 8, 0) > LINUX_VERSION_CODE
 	ret = dma_map_sg(attach->dev, sgt->sgl, sgt->nents, dir);
 #else
-	ret = dma_map_sgtable(attach->dev, sgt, dir, DMA_ATTR_SKIP_CPU_SYNC);
+	ret = dma_map_sgtable(attach->dev, sgt, dir, 0);
 #endif
 	if (ret) {
-		dev_err(npu, "failed to map sgtable for the attached dev\n");
-		goto fail;
+		dev_err(priv->mm->dev, "failed to map sgtable for attached dev\n");
+		sg_free_table(sgt);
+		kfree(sgt);
+		return NULL;
 	}
 
-	priv->sgt = sgt;
 	return sgt;
-
-fail:
-	devm_kfree(npu, sgt);
-	return NULL;
 }
 
-static void aipu_unmap_dma_buf(struct dma_buf_attachment *attach, struct sg_table *st,
+static void aipu_unmap_dma_buf(struct dma_buf_attachment *attach, struct sg_table *sgt,
 			       enum dma_data_direction dir)
 {
+#if KERNEL_VERSION(5, 8, 0) > LINUX_VERSION_CODE
+	dma_unmap_sg(attach->dev, sgt->sgl, sgt->nents, dir);
+#else
+	dma_unmap_sgtable(attach->dev, sgt, dir, 0);
+#endif
+	sg_free_table(sgt);
+	kfree(sgt);
 }
 
 static int aipu_dma_buf_mmap(struct dma_buf *dmabuf, struct vm_area_struct *vma)
@@ -150,13 +153,13 @@ int aipu_alloc_dma_buf(struct aipu_memory_manager *mm, struct aipu_dma_buf_reque
 	struct aipu_dma_buf_priv *priv = NULL;
 	char *va = NULL;
 	struct dma_buf *dmabuf = NULL;
-	struct aipu_phy_block *block;
+	struct aipu_phy_block *block = NULL;
+
 	DEFINE_DMA_BUF_EXPORT_INFO(exp);
 
 	if (!mm || !request || !request->bytes)
 		return -EINVAL;
-
-	if(mm->version >= AIPU_ISA_VERSION_ZHOUYI_V3_2_0 && mm->has_iommu) {
+	if(mm->version >= AIPU_ISA_VERSION_ZHOUYI_V3_2 && mm->has_iommu) {
 		memset(&inter_req, 0, sizeof(struct aipu_buf_request));
 		inter_req.bytes = request->bytes;
 		inter_req.align_in_page = 1;
@@ -168,7 +171,7 @@ int aipu_alloc_dma_buf(struct aipu_memory_manager *mm, struct aipu_dma_buf_reque
 		inter_req.alloc_mode = AIPU_DMA_BUF_MALLOC_DEFAULT;
 #else
 		inter_req.exec_id = DMA_BUF_EXEC_ID;
-		inter_req.alloc_mode = AIPU_DMA_BUF_MALLOC_BOTH;
+		inter_req.alloc_mode = AIPU_DMA_BUF_MALLOC_IOVA_PHY;
 #endif
 		ret = aipu_alloc_dma_iova_phy(mm,  &inter_req, NULL);
 		if (ret) {
@@ -205,6 +208,15 @@ int aipu_alloc_dma_buf(struct aipu_memory_manager *mm, struct aipu_dma_buf_reque
 			ret = -EFAULT;
 			goto fail;
 		}
+
+		block = aipu_get_block_buffer(mm, inter_req.desc.pa,
+					      "aipu_alloc_dma_buf");
+		if (!block) {
+			dev_err(mm->dev,
+				"failed to find block for dma-buf export\n");
+			ret = -EFAULT;
+			goto fail;
+		}
 	}
 
 	priv = devm_kzalloc(mm->dev, sizeof(*priv), GFP_KERNEL);
@@ -218,6 +230,10 @@ int aipu_alloc_dma_buf(struct aipu_memory_manager *mm, struct aipu_dma_buf_reque
 	priv->dma_pa = inter_req.desc.pa;
 	priv->bytes = inter_req.desc.bytes;
 	priv->va = va;
+	if (block) {
+		priv->pages = block->pages;
+		priv->page_count = block->page_count;
+	}
 
 	exp.ops = &aipu_dma_buf_ops;
 	exp.size = inter_req.desc.bytes;
@@ -230,7 +246,7 @@ int aipu_alloc_dma_buf(struct aipu_memory_manager *mm, struct aipu_dma_buf_reque
 		goto fail;
 	}
 
-	if(mm->version >= AIPU_ISA_VERSION_ZHOUYI_V3_2_0)
+	if(mm->version >= AIPU_ISA_VERSION_ZHOUYI_V3_2)
 		block->dmabuf = dmabuf;
 	request->fd = dma_buf_fd(dmabuf, exp.flags);
 	return 0;
@@ -238,7 +254,7 @@ int aipu_alloc_dma_buf(struct aipu_memory_manager *mm, struct aipu_dma_buf_reque
 fail:
 	if (priv)
 		devm_kfree(mm->dev, priv);
-	if(mm->version >= AIPU_ISA_VERSION_ZHOUYI_V3_2_0)
+	if(mm->version >= AIPU_ISA_VERSION_ZHOUYI_V3_2)
 		aipu_free_dma_iova_phy(mm, &inter_req.desc, NULL);
 	else
 		aipu_mm_free(mm, &inter_req.desc, NULL, true);
@@ -268,22 +284,17 @@ int aipu_free_dma_buf(struct aipu_memory_manager *mm, int fd)
 	buf.bytes = priv->bytes;
 	buf.region = AIPU_BUF_REGION_DEFAULT;
 	buf.asid = AIPU_BUF_ASID_0;
-	if(mm->has_iommu && mm->version >= AIPU_ISA_VERSION_ZHOUYI_V3_2_0) {
+	if(mm->has_iommu && mm->version >= AIPU_ISA_VERSION_ZHOUYI_V3_2) {
 #if AIPU_USE_STANDARD_DMA_API_FOR_V3_2
 		buf.exec_id = 0;
 #else
 		buf.exec_id = DMA_BUF_EXEC_ID;
-		buf.mode = AIPU_DMA_BUF_FREE_BOTH;
 #endif
 	} else {
 		buf.exec_id = 0;
 	}
 
 	ret = aipu_free_dma_iova_phy(mm, &buf, NULL);
-	if (priv->sgt) {
-		devm_kfree(mm->dev, priv->sgt);
-		priv->sgt = NULL;
-	}
 
 	devm_kfree(mm->dev, priv);
 	dma_buf_put(dmabuf);
@@ -310,91 +321,143 @@ int aipu_get_dma_buf_info(struct aipu_dma_buf *dmabuf_info)
 	return 0;
 }
 
-int aipu_attach_dma_buf(struct aipu_memory_manager *mm, struct aipu_dma_buf *dmabuf_info)
+int aipu_attach_dma_buf(struct aipu_memory_manager *mm, struct aipu_dma_buf *dmabuf_info,
+			struct file *filp)
 {
 	struct dma_buf *dmabuf = NULL;
 	struct dma_buf_attachment *attach = NULL;
 	struct sg_table *table = NULL;
 	struct aipu_dma_buf_importer *im_buf = NULL;
-	int ret = 0;
+	int ret = -EINVAL;
 
 	if (!mm || !dmabuf_info || dmabuf_info->fd <= 0)
 		return -EINVAL;
 
-	if (mm->version >= AIPU_ISA_VERSION_ZHOUYI_V3_2_0 && mm->has_iommu) {
-		ret = aipu_copy_block_by_dma_fd(mm, dmabuf_info);
-		if(ret)
-			return ret;
-	} else {
-		dmabuf = dma_buf_get(dmabuf_info->fd);
-		if (!dmabuf)
-			return -EINVAL;
-		attach = dma_buf_attach(dmabuf, mm->dev);
-		if (!attach)
-			return -EINVAL;
+	dmabuf = dma_buf_get(dmabuf_info->fd);
+	if (!dmabuf)
+		return -EINVAL;
 
-		table = dma_buf_map_attachment(attach, DMA_BIDIRECTIONAL);
-		if (!table)
-			return -EINVAL;
+	attach = dma_buf_attach(dmabuf, mm->dev);
+	if (!attach)
+		goto err_put;
 
-		dmabuf_info->pa = sg_dma_address(table->sgl);
-		dmabuf_info->bytes = sg_dma_len(table->sgl);
-		dma_buf_put(dmabuf);
-	}
+	table = dma_buf_map_attachment(attach, DMA_BIDIRECTIONAL);
+	if (!table)
+		goto err_detach;
 
 	im_buf = devm_kzalloc(mm->dev, sizeof(*im_buf), GFP_KERNEL);
-	if (!im_buf)
-		return -ENOMEM;
+	if (!im_buf) {
+		ret = -ENOMEM;
+		goto err_unmap;
+	}
+
+	if (mm->use_v3_custom_iova) {
+		/*
+		 * V3 custom IOVA domain is active: sg_dma_address() would return
+		 * an IOVA from the kernel's default DMA-IOMMU cookie, which does
+		 * not fall inside an ASID's usable window and the NPU cannot
+		 * translate it. Re-map the imported pages into the custom domain
+		 * (default context = ASID 0) so the NPU sees a valid address.
+		 */
+		u64 pa = 0, size = 0;
+
+		ret = aipu_mm_v3_map_imported_sgt(mm, table, 0, &pa, &size);
+		if (ret)
+			goto err_free;
+		dmabuf_info->pa = pa;
+		dmabuf_info->bytes = size;
+		im_buf->dev_pa = pa;
+		im_buf->map_size = size;
+		im_buf->asid = 0;
+	} else {
+		dmabuf_info->pa = sg_dma_address(table->sgl);
+		dmabuf_info->bytes = sg_dma_len(table->sgl);
+		im_buf->map_size = 0;
+	}
 
 	im_buf->fd = dmabuf_info->fd;
 	im_buf->attach = attach;
 	im_buf->table = table;
-	if (mm->version >= AIPU_ISA_VERSION_ZHOUYI_V3_2_0 && mm->has_iommu) {
-		im_buf->desc.pa = dmabuf_info->pa;
-		im_buf->desc.bytes = dmabuf_info->bytes;
-		im_buf->desc.exec_id = DMA_BUF_EXEC_ID;
-	}
+	/* Keep our own dmabuf ref for the attachment's lifetime (released in
+	 * aipu_importer_teardown_locked); do NOT dma_buf_put() here.
+	 */
+	im_buf->dmabuf = dmabuf;
+	im_buf->filp = filp;
 	mutex_lock(&mm->lock);
 	list_add(&im_buf->node, &mm->importer_bufs->node);
 	mutex_unlock(&mm->lock);
 
-
 	return 0;
+
+err_free:
+	devm_kfree(mm->dev, im_buf);
+err_unmap:
+	dma_buf_unmap_attachment(attach, table, DMA_BIDIRECTIONAL);
+err_detach:
+	dma_buf_detach(dmabuf, attach);
+err_put:
+	dma_buf_put(dmabuf);
+	return ret;
+}
+
+/* Detach and free one importer entry. Caller must hold mm->lock. */
+static void aipu_importer_teardown_locked(struct aipu_memory_manager *mm,
+					  struct aipu_dma_buf_importer *im_buf)
+{
+	if (im_buf->map_size)
+		aipu_mm_v3_unmap_imported_sgt(mm, im_buf->dev_pa,
+					      im_buf->map_size, im_buf->asid);
+	dma_buf_unmap_attachment(im_buf->attach, im_buf->table, DMA_BIDIRECTIONAL);
+	dma_buf_detach(im_buf->dmabuf, im_buf->attach);
+	list_del(&im_buf->node);
+	dma_buf_put(im_buf->dmabuf);
+	devm_kfree(mm->dev, im_buf);
 }
 
 int aipu_detach_dma_buf(struct aipu_memory_manager *mm, int fd)
 {
 	struct aipu_dma_buf_importer *im_buf = NULL;
 	struct aipu_dma_buf_importer *next = NULL;
-	struct dma_buf *dmabuf = NULL;
 	int ret = -EINVAL;
 
 	if (!mm || fd <= 0)
 		return -EINVAL;
 
-	dmabuf = dma_buf_get(fd);
-	if (!dmabuf)
-		return -EINVAL;
-
 	mutex_lock(&mm->lock);
 	list_for_each_entry_safe(im_buf, next, &mm->importer_bufs->node, node) {
 		if (fd == im_buf->fd) {
-			if (mm->version >= AIPU_ISA_VERSION_ZHOUYI_V3_2_0 && mm->has_iommu) {
-				im_buf->desc.mode = AIPU_DMA_BUF_DETA_IOVA;
-				aipu_free_dma_iova_phy(mm, &im_buf->desc, NULL);
-			} else {
-				dma_buf_unmap_attachment(im_buf->attach, im_buf->table, DMA_BIDIRECTIONAL);
-				dma_buf_detach(dmabuf, im_buf->attach);
-			}
-			list_del(&im_buf->node);
-			devm_kfree(mm->dev, im_buf);
+			aipu_importer_teardown_locked(mm, im_buf);
 			ret = 0;
 			break;
 		}
 	}
 	mutex_unlock(&mm->lock);
-	dma_buf_put(dmabuf);
+
 	return ret;
+}
+
+/*
+ * aipu_detach_dma_buf_by_filp - reclaim imports an owner never detached
+ *
+ * Called from aipu_release() (the fd-close path, which always runs on process
+ * exit). Without this, an attach without a matching detach leaked the import's
+ * custom-IOVA forever and inflated asid_iova[].iova_used, eventually starving
+ * normal allocations with "V3: ASID 0 out of IOVA space".
+ */
+void aipu_detach_dma_buf_by_filp(struct aipu_memory_manager *mm, struct file *filp)
+{
+	struct aipu_dma_buf_importer *im_buf = NULL;
+	struct aipu_dma_buf_importer *next = NULL;
+
+	if (!mm || !mm->importer_bufs)
+		return;
+
+	mutex_lock(&mm->lock);
+	list_for_each_entry_safe(im_buf, next, &mm->importer_bufs->node, node) {
+		if (im_buf->filp == filp)
+			aipu_importer_teardown_locked(mm, im_buf);
+	}
+	mutex_unlock(&mm->lock);
 }
 
 #if KERNEL_VERSION(5, 4, 0) < LINUX_VERSION_CODE

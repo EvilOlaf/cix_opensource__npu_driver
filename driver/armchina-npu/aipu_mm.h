@@ -20,6 +20,22 @@
 #define DEFERRED_FREE  1
 #define DMA_BUF_EXEC_ID 1
 
+/* ------------------------------------------------------------------------
+ * DEBUG: V3 custom-IOVA lifecycle tracing (DPTSW-23453 SMMU event 0x10).
+ * Shared by aipu_mm.c (alloc/map/unmap/free) and aipu_job_manager.c
+ * (job dispatch / hold-TCB chain). grep dmesg for "V3IOVA".
+ * Set V3_IOVA_DEBUG to 1 to re-enable the probes (alloc/map/unmap/free ring,
+ * TCB chain walks, dispatch/retire diagnostics). Compiled out by default for
+ * release builds.
+ * ------------------------------------------------------------------------ */
+#define V3_IOVA_DEBUG 0
+#if V3_IOVA_DEBUG
+#define v3dbg(mm, fmt, ...) \
+	dev_info((mm)->dev, "V3IOVA " fmt, ##__VA_ARGS__)
+#else
+#define v3dbg(mm, fmt, ...) do { } while (0)
+#endif
+
 enum aipu_gm_policy {
 	AIPU_GM_POLICY_NONE         = 0,
 	AIPU_GM_POLICY_SHARED       = 1,
@@ -66,6 +82,15 @@ struct __cache_ops {
     void (*flush_range)(void *vaddr, size_t size);
     void (*clean_range)(void *vaddr, size_t size);
     void (*invalidate_range)(void *vaddr, size_t size);
+    /*
+     * flush_range_nb: same as flush_range but WITHOUT the trailing barrier,
+     * for use in per-page loops that issue a single flush_barrier() at the end.
+     * flush_barrier: the deferred completion barrier (e.g. dsb sy). Both may be
+     * NULL on arches that have not opted in; callers must fall back to
+     * flush_range (which carries its own barrier) when flush_range_nb is NULL.
+     */
+    void (*flush_range_nb)(void *vaddr, size_t size);
+    void (*flush_barrier)(void);
     size_t cache_line_size;
 };
 
@@ -96,6 +121,19 @@ struct aipu_iova_buffer {
 	int pid;
 	struct list_head node;
 	u64 exec_id;
+	u32 data_type;		/* DEBUG: aipu_mm_data_type captured at alloc */
+	/*
+	 * Deferred-free: when set, the buffer has been logically freed by the
+	 * owning fd (aipu_free_dma_iova_phy path) but its IOMMU mapping and IOVA
+	 * are kept live until fd close. This defeats intra-fd use-after-unmap
+	 * (DPTSW-23453 SMMU event 0x10): load-time intermediates freed by the SDK
+	 * are still referenced by NPU-walked rodata/command-pool state, so tearing
+	 * down their PTEs immediately lets a later job fault on the stale ref.
+	 * The buffer stays on buffer_list so lookups (find_block_by_iova,
+	 * iova_to_phys) keep resolving while the fd is alive; destroy happens in
+	 * aipu_mm_v3_free_buffers_by_filp / aipu_mm_v3_destroy_buffer_now.
+	 */
+	bool deferred;
 };
 
 /**
@@ -242,6 +280,16 @@ struct aipu_sram_disable_per_fd {
  * @tbuf_cache: slab cache of the tcb descriptors
  * @importer_bufs: buffers from dma-buf importer(s)
  */
+/**
+ * struct aipu_asid_iova_info - Per-ASID IOVA management for V3
+ */
+struct aipu_asid_iova_info {
+	u64 iova_base;		/* IOVA base for this ASID (e.g., 0, 3GB, 6GB...) */
+	u64 iova_size;		/* IOVA size per ASID (3GB for V3) */
+	u64 iova_used;		/* Currently used IOVA size */
+	u64 asid_base;		/* NPU view base address (e.g., 0, 4GB, 8GB...) */
+};
+
 struct aipu_memory_manager {
 	int version;
 	bool has_iommu;
@@ -278,6 +326,12 @@ struct aipu_memory_manager {
 	u32 buffer_count;
 	u64 host_aipu_offset;
 	struct __cache_ops cache_ops;
+	
+	/* V3 custom IOVA support */
+	bool use_v3_custom_iova;	/* Enable V3 custom IOVA mode */
+	struct aipu_asid_iova_info asid_iova[ZHOUYI_ASID_COUNT];
+	spinlock_t asid_lock;	/* Serialize asid_iova[].iova_used accounting */
+	struct aipu_tcb_buf *v3_tcb_buf_head;	/* V3 custom IOVA TCB buffer list */
 };
 
 int aipu_init_mm(struct aipu_memory_manager *mm, struct platform_device *p_dev, int version);
@@ -292,6 +346,57 @@ void aipu_mm_free_buffers(struct aipu_memory_manager *mm, struct file *filp);
 char *aipu_mm_get_va(struct aipu_memory_manager *mm, u64 dev_pa);
 int aipu_mm_mmap_buf(struct aipu_memory_manager *mm, struct vm_area_struct *vma,
 		     struct file *filp);
+
+/* V3 custom IOVA support */
+int aipu_mm_v3_init_iova_domain(struct aipu_memory_manager *mm);
+void aipu_mm_v3_deinit_iova_domain(struct aipu_memory_manager *mm);
+struct aipu_iova_buffer *aipu_mm_v3_alloc_iova(struct aipu_memory_manager *mm,
+					       struct aipu_buf_request *buf_req,
+					       struct file *filp);
+int aipu_mm_v3_alloc_phy_and_map(struct aipu_memory_manager *mm,
+					struct aipu_iova_buffer *buffer,
+					struct aipu_buf_request *buf_req);
+void aipu_mm_v3_free_iova_buffer(struct aipu_memory_manager *mm,
+					struct aipu_iova_buffer *buffer);
+void aipu_mm_v3_destroy_buffer_now(struct aipu_memory_manager *mm,
+					struct aipu_iova_buffer *buffer);
+void aipu_mm_v3_free_buffers_by_filp(struct aipu_memory_manager *mm,
+					struct file *filp);
+struct aipu_phy_block *aipu_mm_v3_find_block_by_iova(struct aipu_memory_manager *mm,
+						    u64 iova, u32 asid);
+u64 aipu_mm_v3_pa_to_iova(struct aipu_memory_manager *mm, u64 dev_pa, u32 asid);
+u64 aipu_mm_v3_iova_to_pa(struct aipu_memory_manager *mm, u64 iova, u32 asid);
+int aipu_mm_v3_map_imported_sgt(struct aipu_memory_manager *mm, struct sg_table *sgt,
+				u32 asid, u64 *out_pa, u64 *out_size);
+void aipu_mm_v3_unmap_imported_sgt(struct aipu_memory_manager *mm, u64 dev_pa,
+				   u64 size, u32 asid);
+u32 aipu_mm_v3_get_tcb_addr(struct aipu_memory_manager *mm, u64 dev_pa, u32 asid);
+/* DEBUG (V3_IOVA_DEBUG): non-zero phys if @iova is currently IOMMU-mapped */
+phys_addr_t aipu_mm_v3_dbg_iova_phys(struct aipu_memory_manager *mm, u64 iova);
+/* DEBUG (V3_IOVA_DEBUG): kernel VA backing @iova (custom path), or NULL */
+void *aipu_mm_v3_dbg_iova_to_va(struct aipu_memory_manager *mm, u64 iova);
+/* DEBUG (V3_IOVA_DEBUG): dump a TCB body (pointer fields + mapped flags) */
+void aipu_mm_v3_dbg_dump_tcb(struct aipu_memory_manager *mm, u64 tcb_pa,
+			     const char *tag);
+/* DEBUG (V3_IOVA_DEBUG): walk head..ltsk via tcb->next, report dangling ptrs */
+void aipu_mm_v3_dbg_dump_tcb_chain(struct aipu_memory_manager *mm, u64 head_pa,
+				   u64 ltsk_pa, const char *tag);
+/* DEBUG (V3_IOVA_DEBUG): scan a task's cp/pp/dp buffer content for dangling
+ * (unmapped) IOVA-looking words -- finds absolute ptrs baked into rodata/params
+ */
+void aipu_mm_v3_dbg_scan_task_ptrs(struct aipu_memory_manager *mm, u64 ftsk_pa,
+				   const char *tag);
+/* DEBUG (V3_IOVA_DEBUG): scan ALL mapped buffers for any word referencing
+ * page_base as a full address OR a shifted page-frame (seg-mmu/GM encodings);
+ * reports the owning buffer IOVA+offset and which encoding matched.
+ */
+void aipu_mm_v3_dbg_scan_all_for(struct aipu_memory_manager *mm, u32 page_base,
+				 const char *tag);
+/* DEBUG (V3_IOVA_DEBUG): raw u32 dump of a TCB header (union-agnostic) so the
+ * seg-mmu / GM / DTCM / asid fields are all visible. @n_words capped at 32.
+ */
+void aipu_mm_v3_dbg_dump_tcb_raw(struct aipu_memory_manager *mm, u64 tcb_pa,
+				 u32 n_words, const char *tag);
 int aipu_mm_disable_sram_allocation(struct aipu_memory_manager *mm, struct file *filp);
 int aipu_mm_enable_sram_allocation(struct aipu_memory_manager *mm, struct file *filp);
 void aipu_mm_get_asid(struct aipu_memory_manager *mm, struct aipu_cap *cap);
@@ -320,16 +425,9 @@ int aipu_free_dma_iova_phy(struct aipu_memory_manager *mm, struct aipu_buf_desc 
 void aipu_cache_flush(struct aipu_memory_manager *mm, void *vaddr, size_t size);
 void aipu_cache_clean(struct aipu_memory_manager *mm, void *vaddr, size_t size);
 void aipu_cache_invalidate(struct aipu_memory_manager *mm, void *vaddr, size_t size);
-struct aipu_phy_block *aipu_get_block_buffer(struct aipu_memory_manager *mm,
-					     u64 iova, char* str);
-struct aipu_iova_buffer *aipu_get_iova_buffer_by_exec_id(struct aipu_memory_manager *mm,
-							 u64 exec_id, char* str);
-int aipu_rebind_dma_iova_phy(struct aipu_memory_manager *mm,
-			     struct aipu_rebind_buf_desc *desc,
-			     struct file *filp);
-int aipu_bind_dma_iova_phy(struct aipu_memory_manager *mm,
-			   struct aipu_bind_buf_desc *desc,
-			   struct file *filp);
-int aipu_copy_block_by_dma_fd(struct aipu_memory_manager *mm,
-			      struct aipu_dma_buf *dmabuf_info);
+void aipu_mm_v3_flush_all_for_filp(struct aipu_memory_manager *mm, struct file *filp);
+struct aipu_phy_block *aipu_get_block_buffer(struct aipu_memory_manager *mm, u64 iova, char* str);
+struct aipu_iova_buffer *aipu_get_iova_buffer_by_job_id(struct aipu_memory_manager *mm, u64 exec_id, char* str);
+int aipu_rebind_dma_iova_phy(struct aipu_memory_manager *mm, struct aipu_rebind_buf_desc *desc, struct file *filp);
+int aipu_bind_dma_iova_phy(struct aipu_memory_manager *mm, struct aipu_bind_buf_desc *desc, struct file *filp);
 #endif /* __AIPU_MM_H__ */
