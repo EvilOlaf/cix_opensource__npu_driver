@@ -44,6 +44,12 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Fetch upstream tags
+        run: |
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+          git remote add upstream https://github.com/cixtech/cix_opensource__npu_driver.git || true
+          git fetch upstream --tags
+
       - name: Get version from debian/changelog
         id: version
         run: |
